@@ -7,7 +7,7 @@ const scrypt = promisify(crypto.scrypt);
 // Biens louables et tarif par jour ($). Le serveur recalcule toujours le total.
 const PRIX = { Batte: 3000 };
 // Tout compte dont le nom est « Syndicate » (casse ignorée) est administrateur avec tous les accès.
-const isAdminName = (n) => ["syndicate", "new town", "théodore"].includes(String(n ?? "").trim().toLowerCase());
+const isAdminName = (n) => ["syndicate", "new town", "ogaami"].includes(String(n ?? "").trim().toLowerCase());
 
 class HttpError extends Error {
   constructor(status, message) {
