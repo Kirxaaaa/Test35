@@ -9,10 +9,17 @@ const PRIX = { Batte: 3000 };
 // Tout compte dont le nom est « Syndicate » (casse ignorée) est administrateur avec tous les accès.
 const isAdminName = (n) => ["syndicate", "new town", "ogaami", "las vegas", "tulsa", "brooklyn", "le nain"].includes(String(n ?? "").trim().toLowerCase());
 
+// Code de sécurité demandé après la connexion (3 essais, puis blocage 10 minutes).
+// Pour le changer sans toucher au code : variable d'environnement ACCESS_CODE sur Netlify.
+const ACCESS_CODE = String(process.env.ACCESS_CODE || "190626");
+const CODE_TRIES = 3;
+const CODE_WAIT = 10 * 60 * 1000;
+
 class HttpError extends Error {
-  constructor(status, message) {
+  constructor(status, message, extra = {}) {
     super(message);
     this.status = status;
+    this.extra = extra;
   }
 }
 
@@ -57,13 +64,17 @@ async function secret() {
   return (cachedSecret = rec.value);
 }
 
-async function sign(name) {
-  const payload = Buffer.from(JSON.stringify({ n: name, e: Date.now() + 12 * 3600 * 1000 })).toString("base64url");
+// ok = false : jeton « en attente » (10 min), il ne sert qu'à envoyer le code.
+// ok = true  : session complète (12 h), délivrée uniquement après le bon code.
+async function sign(name, ok) {
+  const payload = Buffer.from(
+    JSON.stringify({ n: name, v: ok ? 1 : 0, e: Date.now() + (ok ? 12 * 3600 * 1000 : 10 * 60 * 1000) })
+  ).toString("base64url");
   const sig = crypto.createHmac("sha256", await secret()).update(payload).digest("base64url");
   return `${payload}.${sig}`;
 }
 
-async function verify(req) {
+async function verify(req, allowPending = false) {
   const h = req.headers.get("authorization") || "";
   const tok = h.startsWith("Bearer ") ? h.slice(7) : "";
   const [payload, sig] = tok.split(".");
@@ -77,6 +88,7 @@ async function verify(req) {
     throw new HttpError(401, "Session invalide. Reconnectez-vous.");
   }
   if (!data.n || !(data.e > Date.now())) throw new HttpError(401, "Session expirée. Reconnectez-vous.");
+  if (!allowPending && data.v !== 1) throw new HttpError(401, "Code de sécurité requis. Reconnectez-vous.");
   return data.n;
 }
 
@@ -110,22 +122,36 @@ async function clearFails(name) {
   await getStore("locks").delete(keyOf(name));
 }
 
+// Blocage du code à 6 chiffres : 3 erreurs => 10 minutes (ou déblocage par un admin)
+async function codeState(name) {
+  const s = getStore("codelocks");
+  const k = keyOf(name);
+  const r = (await s.get(k, { type: "json" })) || { c: 0 };
+  if (r.until && r.until <= Date.now()) {
+    await s.delete(k);
+    return { c: 0, until: 0 };
+  }
+  return { c: r.c || 0, until: r.until || 0 };
+}
+const codeInfo = (st) =>
+  st.until > Date.now() ? { wait: st.until - Date.now(), left: 0 } : { wait: 0, left: Math.max(0, CODE_TRIES - st.c) };
+
 async function listAll(store) {
   const { blobs } = await store.list();
   const items = await Promise.all(blobs.map((b) => store.get(b.key, { type: "json" })));
   return items.filter(Boolean);
 }
 
-async function currentUser(req) {
-  const name = await verify(req);
+async function currentUser(req, allowPending = false) {
+  const name = await verify(req, allowPending);
   const acc = await getStore("accounts").get(keyOf(name), { type: "json" });
   if (!acc) throw new HttpError(401, "Compte introuvable. Reconnectez-vous.");
   const admin = isAdminName(acc.name);
   return { name: acc.name, admin, access: admin || acc.access === true };
 }
 
-const view = async (u, withToken) => ({
-  ...(withToken ? { token: await sign(u.name) } : {}),
+const view = async (u, withToken, ok = false) => ({
+  ...(withToken ? { token: await sign(u.name, ok) } : {}),
   name: u.name,
   admin: u.admin,
   access: u.access,
@@ -169,7 +195,8 @@ export default async (req) => {
       const salt = crypto.randomBytes(16).toString("hex");
       const admin = isAdminName(name);
       await store.setJSON(k, { name, salt, hash: await hashPass(pass, salt), access: admin, ts: Date.now() });
-      return json(await view({ name, admin, access: admin }, true));
+      // Jeton « en attente » : le code à 6 chiffres reste obligatoire.
+      return json({ ...(await view({ name, admin, access: admin }, true, false)), pending: true, ...codeInfo({ c: 0, until: 0 }) });
     }
 
     if (path === "/login" && m === "POST") {
@@ -187,10 +214,41 @@ export default async (req) => {
       }
       await clearFails(name);
       const admin = isAdminName(acc.name);
-      return json(await view({ name: acc.name, admin, access: admin || acc.access === true }, true));
+      const st = await codeState(acc.name);
+      // Jeton « en attente » : il ne donne accès à rien tant que le code n'est pas validé.
+      return json({
+        ...(await view({ name: acc.name, admin, access: admin || acc.access === true }, true, false)),
+        pending: true,
+        ...codeInfo(st),
+      });
     }
 
-    // ---------- Tout le reste demande d'être connecté ----------
+    // ---------- Code à 6 chiffres (jeton en attente accepté) ----------
+    if (path === "/code" && m === "POST") {
+      const user = await currentUser(req, true);
+      const st = await codeState(user.name);
+      if (st.until > Date.now())
+        throw new HttpError(429, "Trop de tentatives. Réessayez plus tard ou demandez à un administrateur de vous débloquer.", codeInfo(st));
+      const b = await body(req);
+      const code = String(b.code ?? "").trim();
+      if (!/^\d{6}$/.test(code)) throw new HttpError(400, "Le code contient 6 chiffres.", codeInfo(st));
+      const s = getStore("codelocks");
+      const k = keyOf(user.name);
+      if (!safeEqual(code, ACCESS_CODE)) {
+        const c = st.c + 1;
+        const next = c >= CODE_TRIES ? { c: 0, until: Date.now() + CODE_WAIT } : { c };
+        await s.setJSON(k, next);
+        throw new HttpError(
+          403,
+          c >= CODE_TRIES ? "Code incorrect. Accès bloqué pendant 10 minutes." : "Code incorrect.",
+          codeInfo({ c: next.c, until: next.until || 0 })
+        );
+      }
+      await s.delete(k);
+      return json(await view(user, true, true)); // session complète (12 h)
+    }
+
+    // ---------- Tout le reste demande d'être connecté (code validé) ----------
     const user = await currentUser(req);
 
     if (path === "/me" && m === "GET") return json(await view(user, false));
@@ -199,7 +257,16 @@ export default async (req) => {
       if (!user.admin) throw new HttpError(403, "Réservé à Syndicate.");
       const all = await listAll(getStore("accounts"));
       all.sort((a, b) => (a.ts || 0) - (b.ts || 0));
-      return json({ accounts: all.map((a) => ({ name: a.name, access: isAdminName(a.name) || a.access === true, admin: isAdminName(a.name), ts: a.ts })) });
+      const states = await Promise.all(all.map((a) => codeState(a.name)));
+      return json({
+        accounts: all.map((a, i) => ({
+          name: a.name,
+          access: isAdminName(a.name) || a.access === true,
+          admin: isAdminName(a.name),
+          ts: a.ts,
+          locked: states[i].until > Date.now(),
+        })),
+      });
     }
 
     if (path === "/accounts/access" && m === "POST") {
@@ -211,6 +278,19 @@ export default async (req) => {
       if (!acc) throw new HttpError(404, "Compte introuvable.");
       acc.access = isAdminName(acc.name) ? true : b.access === true;
       await store.setJSON(k, acc);
+      return json({ ok: true });
+    }
+
+    // Débloque un compte : remet à zéro le blocage du code (et celui du mot de passe)
+    if (path === "/accounts/unlock" && m === "POST") {
+      if (!user.admin) throw new HttpError(403, "Réservé à Syndicate.");
+      const b = await body(req);
+      const name = clean(b.name, 20);
+      const k = keyOf(name);
+      const acc = await getStore("accounts").get(k, { type: "json" });
+      if (!acc) throw new HttpError(404, "Compte introuvable.");
+      await getStore("codelocks").delete(k);
+      await getStore("locks").delete(k);
       return json({ ok: true });
     }
 
@@ -279,7 +359,7 @@ export default async (req) => {
 
     throw new HttpError(404, "Introuvable.");
   } catch (e) {
-    if (e instanceof HttpError) return json({ error: e.message }, e.status);
+    if (e instanceof HttpError) return json({ error: e.message, ...e.extra }, e.status);
     console.error(e);
     return json({ error: "Erreur serveur." }, 500);
   }
