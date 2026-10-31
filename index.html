@@ -619,14 +619,19 @@ body.dark-admin{background:#050a14}
   }
   function renderAccounts(){
     document.getElementById('list-comptes').innerHTML=accounts.map(function(a){
-      if(a.admin)return '<li><span>'+esc(a.name)+' (administrateur)</span></li>';
-      return '<li><span>'+esc(a.name)+'</span><button class="ret" data-act="acc" data-name="'+esc(a.name)+'" data-acc="'+(a.access?'1':'0')+'">'+(a.access?'Retirer l’accès':'Donner l’accès')+'</button>'+(a.locked?'<button class="ret" data-act="unlock" data-name="'+esc(a.name)+'">Débloquer (code bloqué)</button>':'')+'</li>';
+      var tag=a.locked?' <b>(bloqué)</b>':'';
+      var ub=a.locked?'<button class="ret" data-act="unlock" data-name="'+esc(a.name)+'">Débloquer</button>':'';
+      if(a.admin)return '<li><span>'+esc(a.name)+' (administrateur)'+tag+'</span>'+ub+'</li>';
+      return '<li><span>'+esc(a.name)+tag+'</span><button class="ret" data-act="acc" data-name="'+esc(a.name)+'" data-acc="'+(a.access?'1':'0')+'">'+(a.access?'Retirer l’accès':'Donner l’accès')+'</button>'+ub+'</li>';
     }).join('')||'<li>Aucun compte créé pour le moment.</li>';
-    var pend=accounts.filter(function(a){return !a.access});
-    var al=document.getElementById('accAlert');
-    al.hidden=!(isAdmin&&pend.length>0);
-    al.textContent=pend.length+' compte(s) en attente d’accès : '+pend.map(function(a){return a.name}).join(', ')+'. Voir l’onglet Comptes.';
+    var pend=accounts.filter(function(a){return !a.access}),lk=accounts.filter(function(a){return a.locked});
+    var al=document.getElementById('accAlert'),t=[];
+    if(pend.length)t.push(pend.length+' compte(s) en attente d’accès : '+pend.map(function(a){return a.name}).join(', ')+'.');
+    if(lk.length)t.push(lk.length+' compte(s) bloqué(s) : '+lk.map(function(a){return a.name}).join(', ')+'.');
+    al.hidden=!(isAdmin&&t.length>0);
+    al.textContent=t.join(' ')+' Voir l’onglet Comptes.';
   }
+
   document.getElementById('list-comptes').addEventListener('click',function(e){
     var b=e.target.closest('button');if(!b||!isAdmin)return;
     var m=document.getElementById('acc-msg'),ok=document.getElementById('acc-ok');m.textContent='';ok.textContent='';
@@ -706,7 +711,7 @@ body.dark-admin{background:#050a14}
     ['accueil','louer','acheter','contrat','locations','comptes'].forEach(function(id){document.getElementById('tp-'+id).hidden=id!==t});
   }
   Array.prototype.forEach.call(document.querySelectorAll('.tab'),function(b){
-    b.addEventListener('click',function(){showTab(b.getAttribute('data-tab'))});
+    b.addEventListener('click',function(){showTab(b.getAttribute('data-tab'));if(b.getAttribute('data-tab')==='comptes')loadData()});
   });
   window.addEventListener('hashchange',route);
 
